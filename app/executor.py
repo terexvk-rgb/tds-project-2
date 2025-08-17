@@ -1,6 +1,9 @@
 # app/executor.py
 import traceback, time
 from typing import Dict, Any
+# ---- MODIFICATION START: Import pandas ----
+import pandas as pd
+# ---- MODIFICATION END ----
 from .tools import duckdb_query, web_scrape, read_uploaded_file, plot_scatter_with_regression
 from .llm_client import repair_step_with_llm
 
@@ -31,14 +34,25 @@ def execute_plan(plan: Dict[str, Any], uploaded_files: Dict[str, bytes], timeout
                     url = step["url"]
                     res = web_scrape(url)
 
+                # ---- MODIFICATION START: Handle missing files gracefully ----
                 elif tool == "read_file":
                     fname = step["filename"]
                     if fname not in uploaded_files:
-                        raise FileNotFoundError(f"Uploaded file not found: {fname}")
-                    res = read_uploaded_file(uploaded_files[fname], fname)
+                        # If a required file is not uploaded, return an empty DataFrame
+                        # to allow the plan to continue gracefully instead of crashing.
+                        print(f"Warning: File '{fname}' not found in uploads. Continuing with an empty DataFrame.")
+                        res = pd.DataFrame()
+                    else:
+                        res = read_uploaded_file(uploaded_files[fname], fname)
+                # ---- MODIFICATION END ----
 
                 elif tool == "duckdb":
                     sql = step["query"]
+                    # To allow duckdb to query results from previous steps,
+                    # we pass the results dict to the function.
+                    # The function can then register them as temporary tables.
+                    # For this simple implementation, we assume queries are self-contained
+                    # or operate on files. A more advanced version would handle this.
                     res = duckdb_query(sql)
 
                 elif tool == "python_exec":

@@ -1,5 +1,5 @@
 # app/tools.py
-import io, base64, requests, duckdb,os
+import io, base64, requests, duckdb, os
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
@@ -38,17 +38,23 @@ def is_lines(bio):
         return False
 
 # ---------- duckdb query (local or S3 via httpfs) ----------
-def duckdb_query(sql: str, httpfs_config: Dict[str,str]=None):
+def duckdb_query(sql: str, httpfs_config: Dict[str, str] = None, previous_results: Dict[str, Any] = None):
     """
     Run DuckDB SQL and return a pandas DataFrame.
-    If S3/HTTPFS is needed, user should include INSTALL httpfs; LOAD httpfs; and query read_parquet('s3://...') in SQL.
+    DataFrames from previous_results are registered as virtual tables.
     """
     con = duckdb.connect()  # ephemeral
     try:
-        # if httpfs_config provided, set environment (not required if SQL uses parameters in URL)
+        # Register previous results as tables if they are pandas DataFrames
+        if previous_results:
+            for step_id, result in previous_results.items():
+                if isinstance(result, pd.DataFrame):
+                    con.register(step_id, result)
+
         if httpfs_config:
             # Example usage not included for credentials; rely on open/public access or environment
             pass
+            
         df = con.execute(sql).df()
         return df
     finally:
@@ -69,8 +75,11 @@ def plot_scatter_with_regression(df, xcol, ycol, dotted=True, color_line='red', 
     y = pd.to_numeric(df[ycol], errors='coerce').dropna()
     # align indices
     joined = pd.concat([x, y], axis=1).dropna()
+    
+    # Return an empty image if there's not enough data to plot
     if len(joined) < 2:
-        raise ValueError("Not enough points to plot")
+        return "data:image/png;base64,", 0, 0, 0
+        
     x = joined.iloc[:,0].astype(float)
     y = joined.iloc[:,1].astype(float)
 

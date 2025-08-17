@@ -1,10 +1,19 @@
-Scrape the list of highest grossing films from Wikipedia. It is at the URL:
-https://en.wikipedia.org/wiki/List_of_highest-grossing_films
+Use the undirected network in `edges.csv`.
 
-Answer the following questions and respond with a JSON array of strings containing the answer.
+Return a JSON object with keys:
+- `edge_count`: number
+- `highest_degree_node`: string
+- `average_degree`: number
+- `density`: number
+- `shortest_path_alice_eve`: number
+- `network_graph`: base64 PNG string under 100kB
+- `degree_histogram`: base64 PNG string under 100kB
 
-1. How many $2 bn movies were released before 2000?
-2. Which is the earliest film that grossed over $1.5 bn?
-3. What's the correlation between the Rank and Peak?
-4. Draw a scatterplot of Rank and Peak along with a dotted red regression line through it.
-   Return as a base-64 encoded data URI, `"data:image/png;base64,iVBORw0KG..."` under 100,000 bytes.
+Answer:
+1. How many edges are in the network?
+2. Which node has the highest degree?
+3. What is the average degree of the network?
+4. What is the network density?
+5. What is the length of the shortest path between Alice and Eve?
+6. Draw the network with nodes labelled and edges shown. Encode as base64 PNG.
+7. Plot the degree distribution as a bar chart with green bars. Encode as base64 PNG.

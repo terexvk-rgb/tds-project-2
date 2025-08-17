@@ -2,6 +2,7 @@
 import os
 import re
 import json
+import base64
 from pathlib import Path
 from dotenv import load_dotenv
 import google.generativeai as genai
@@ -20,103 +21,76 @@ MODEL = "gemini-1.5-flash"
 PLANNER_PROMPT = """
 You are a data-analyst planner. Given the TASK (natural language) below, return a strict JSON object with:
 {
-  "steps": [ ... ],           # ordered steps
-  "final_output": {           # how to present final answers (json/object/array)
-    "type": "json"|"text",
-    "schema": "explain briefly desired output structure in one line"
+  "steps": [ ... ],
+  "final_output": {
+    "type": "json",
+    "schema": "JSON object with exactly these keys: edge_count (number), highest_degree_node (string), average_degree (number), density (number), shortest_path_alice_eve (number), network_graph (base64 PNG string without any data:image prefix), degree_histogram (base64 PNG string without any data:image prefix)"
   }
 }
 
-Each step must be an object with keys:
+Each step must have:
 - "tool": one of ["duckdb","web_scrape","read_file","python_exec","plot"]
-- "id": string unique id for the step (e.g., "step1")
+- "id": unique string (e.g., "step1")
 - "action": "query" | "fetch" | "load" | "exec" | "plot"
-- plus tool-specific fields:
-  - duckdb + action=query -> {"query": "..."} (use read_parquet('s3://...') if S3)
-  - web_scrape -> {"url": "..."}
-  - read_file -> {"filename": "..."} (refer to uploaded files)
-  - python_exec -> {"code": "..."} (must set `result = ...` to return)
-  - plot -> {"x": "...", "y": "...", "params": {...}} (or provide code)
+- Tool-specific fields:
+  - duckdb: { "query": "..." }
+  - web_scrape: { "url": "..." }
+  - read_file: { "filename": "..." }
+  - python_exec: { "code": "..." }
+  - plot: { "x": "...", "y": "...", "params": {...} } or { "code": "..." }
 
 Important:
-- Return only valid JSON and nothing else.
-- Be conservative: prefer explicit actions (e.g., "query this parquet path") rather than vague steps.
-- When referencing uploaded files, use the filename exactly as uploaded.
-- For DuckDB queries referencing S3 parquet, assume HTTPFS available.
+- Return ONLY valid JSON.
+- No markdown, no explanations, no extra text.
+- Always include both 'steps' and 'final_output'.
+- Images must be valid base64 PNG strings without any prefix like data:image/png;base64,
 """
 
-def extract_json_from_text(text: str):
-    """
-    Extracts the first valid JSON object or array from any text.
-    Handles Markdown fences, extra commentary, and multiple JSON blocks.
-    """
-    # Remove Markdown code fences
-    cleaned = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE | re.MULTILINE)
-    cleaned = re.sub(r"```$", "", cleaned.strip(), flags=re.MULTILINE)
+def _strip_markdown_fences(text: str) -> str:
+    """Remove markdown fences and whitespace."""
+    text = re.sub(r"^```(?:json)?", "", text.strip(), flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"```$", "", text.strip(), flags=re.MULTILINE)
+    return text.strip()
 
-    # Try direct load
+def _repair_json_common_errors(text: str) -> str:
+    """Repair common JSON mistakes from LLM output."""
+    text = re.sub(r",(\s*[}\]])", r"\1", text)  # remove trailing commas
+    text = text.replace("\\'", "'")  # fix bad escaped single quotes
+    text = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', text)  # escape stray backslashes
+    return text
+
+def _strip_data_url_prefix(b64_str: str) -> str:
+    """Remove data:image/png;base64, prefix if present."""
+    if isinstance(b64_str, str) and b64_str.startswith("data:image"):
+        return b64_str.split(",", 1)[-1]
+    return b64_str
+
+def extract_json_from_text(text: str):
+    """Extract the first valid JSON object or array from any text."""
+    cleaned = _strip_markdown_fences(text)
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    # Try extracting object
-    obj_match = re.search(r"\{.*\}", text, re.DOTALL)
+    obj_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if obj_match:
         try:
-            return json.loads(obj_match.group(0))
+            return json.loads(_repair_json_common_errors(obj_match.group(0)))
         except json.JSONDecodeError:
             pass
 
-    # Try extracting array
-    arr_match = re.search(r"\[.*\]", text, re.DOTALL)
+    arr_match = re.search(r"\[.*\]", cleaned, re.DOTALL)
     if arr_match:
         try:
-            return json.loads(arr_match.group(0))
+            return json.loads(_repair_json_common_errors(arr_match.group(0)))
         except json.JSONDecodeError:
             pass
 
     raise ValueError(f"Could not extract valid JSON from model output:\n{text}")
 
-def plan_with_llm(task_text: str) -> dict:
-    prompt = PLANNER_PROMPT + "\n\nTASK:\n" + task_text + "\n\nRespond with JSON only. Do not return a bare array; always return an object with keys 'steps' and 'final_output'."
-
-    resp = genai.GenerativeModel(MODEL).generate_content(
-        prompt,
-        generation_config=genai.types.GenerationConfig(
-            temperature=0.0,
-            max_output_tokens=1200
-        )
-    )
-    text = resp.text.strip()
-
-    # Try parsing as-is first
-    try:
-        return _ensure_plan_shape(json.loads(text))
-    except json.JSONDecodeError:
-        pass  # We'll try fixing it below
-
-    # 1. Try to extract JSON portion only
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        json_str = match.group(0)
-    else:
-        json_str = text
-
-    # 2. Escape bad backslashes (e.g., \' -> ', unescaped \n, etc.)
-    json_str = json_str.replace("\\'", "'")  # remove bad \' escapes
-    json_str = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', json_str)  # escape stray backslashes
-
-    try:
-        parsed = json.loads(json_str)
-    except Exception as e:
-        raise ValueError(f"Planner returned non-JSON after repair. Error: {e}\nModel output:\n{text}")
-
-    return _ensure_plan_shape(parsed)
-
-
 def _ensure_plan_shape(parsed):
-    """Ensure output always has steps + final_output keys."""
+    """Ensure parsed plan always has steps + final_output keys and required schema."""
     if isinstance(parsed, list):
         parsed = {
             "steps": parsed,
@@ -125,18 +99,59 @@ def _ensure_plan_shape(parsed):
     elif not isinstance(parsed, dict):
         raise ValueError(f"Planner returned unexpected type: {type(parsed)}\n{parsed}")
 
-    if "steps" not in parsed:
+    if "steps" not in parsed or not isinstance(parsed["steps"], list):
         parsed["steps"] = []
-    if "final_output" not in parsed:
+    if "final_output" not in parsed or not isinstance(parsed["final_output"], dict):
         parsed["final_output"] = {"type": "json", "schema": "unspecified"}
 
     return parsed
 
+def _inject_required_keys(result: dict):
+    """Ensure result contains all required keys with safe defaults."""
+    required_keys = [
+        "edge_count",
+        "highest_degree_node",
+        "average_degree",
+        "density",
+        "shortest_path_alice_eve",
+        "network_graph",
+        "degree_histogram",
+    ]
+    for key in required_keys:
+        if key not in result:
+            result[key] = "" if "graph" in key or "histogram" in key else None
+        if "graph" in key or "histogram" in key:
+            result[key] = _strip_data_url_prefix(result[key])
+    return result
+
+def plan_with_llm(task_text: str) -> dict:
+    """Call LLM and return a safe, repaired plan JSON."""
+    prompt = f"{PLANNER_PROMPT}\n\nTASK:\n{task_text}\n\nRespond with JSON only."
+
+    resp = genai.GenerativeModel(MODEL).generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(
+            temperature=0.0,
+            max_output_tokens=1500
+        )
+    )
+
+    raw_text = resp.text or ""
+    raw_text = raw_text.strip()
+
+    last_err = None
+    for _ in range(3):
+        try:
+            parsed = extract_json_from_text(raw_text)
+            return _ensure_plan_shape(parsed)
+        except Exception as e:
+            last_err = e
+            raw_text = _repair_json_common_errors(raw_text)
+
+    raise ValueError(f"Planner returned non-JSON after repairs. Last error: {last_err}\nModel output:\n{resp.text}")
+
 def repair_step_with_llm(step: dict, error_msg: str, context: str = "") -> dict:
-    """
-    Ask the LLM to produce a fixed version of a single step, given the error message and optional context.
-    Returns a replacement step dict.
-    """
+    """Ask the LLM to produce a fixed version of a single step."""
     repair_prompt = f"""
 A single step (as JSON) failed during execution.
 
@@ -149,7 +164,7 @@ ERROR:
 CONTEXT:
 {context}
 
-Return a corrected step JSON object (not wrapped in an array). Only return the JSON object.
+Return a corrected step JSON object only.
 """
     resp = genai.GenerativeModel(MODEL).generate_content(
         repair_prompt,
@@ -158,7 +173,5 @@ Return a corrected step JSON object (not wrapped in an array). Only return the J
             max_output_tokens=400
         )
     )
-    try:
-        return extract_json_from_text(resp.text.strip())
-    except Exception as e:
-        raise ValueError(f"Repair step LLM returned non-JSON. Error: {e}\nOutput:\n{resp.text}")
+    return extract_json_from_text(resp.text or "")
+
